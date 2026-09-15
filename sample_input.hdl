@@ -1,0 +1,7 @@
+input a, b;
+output y;
+wire w1;
+reg clk;
+
+w1 = a and b;
+y = w1 or clk;

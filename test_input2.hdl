@@ -1,0 +1,9 @@
+input x, y, z;
+output out1, out2;
+wire w1, w2;
+reg state;
+
+w1 = x and y;
+w2 = w1 or z;
+out1 = w2 and not state;
+out2 = state or w1;
