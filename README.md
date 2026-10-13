@@ -1,117 +1,157 @@
-# Compiler Design Lab — Review 1
-## Mini Compiler for a Hardware Description Language (HDL)
-### Phase Implemented: Lexical Analysis
+﻿# HDL Compiler Studio — Compiler Design Lab (Complete Pipeline)
 
-## Files
-| File | Purpose |
-|---|---|
-| `hdl_lexer.l` | Flex source — token rules + symbol table logic |
-| `sample_input.hdl` | Sample HDL program (matches the one shown in the review) |
-| `test_input2.hdl` | Second, larger test case (multiple signals, nested gates) |
-| `Makefile` | Build/run automation |
+A complete 4-stage compiler pipeline for a custom **Hardware Description Language (HDL)** that compiles digital circuit representations through all core compiler phases: **Lexical Analysis (Review 1)**, **Syntax Analysis (Review 2)**, **Intermediate Code Generation (Review 3)**, and **Code Optimization & Target Code Generation (Review 4)**.
 
-## Language Recognized
+All compiler stages are written in **C / Flex** and visualized in a modern, academic web studio.
+
+---
+
+## 🏗️ Compiler Architecture & Pipeline
+
 ```
-input a, b;
-output y;
-wire w1;
-reg clk;
+HDL Source (.hdl)
+       │
+       ▼
+[Review 1: Lexical Analysis] (Flex / C)
+  ├── Token Table (Lexemes, Types, Lines)
+  └── Symbol Table (Ports, Wires, Registers)
+       │
+       ▼
+[Review 2: Syntax Analysis] (C Recursive Descent Parser)
+  ├── Grammar Rule Verification
+  └── Formatted Parse Tree Generation
+       │
+       ▼
+[Review 3: Intermediate Code Generation] (C TAC Generator)
+  ├── Three-Address Code (TAC) Quadruples
+  └── Temporary Register Tracking
+       │
+       ▼
+[Review 4: Optimization & Code Generation] (C RTL Generator)
+  ├── Common Subexpression Elimination (CSE)
+  ├── Dead Code Elimination (DCE)
+  ├── Optimization Metrics & Comparison
+  └── Target Machine Code (Register-Transfer Level - RTL)
+```
+
+---
+
+## 📁 Repository Structure
+
+| Path | Stage | Description |
+|---|---|---|
+| `hdl_lexer.l` | Stage 1 | Flex lexical specification and symbol table manager |
+| `hdl_lexer.exe` | Stage 1 | Compiled Windows binary for Lexical Analysis |
+| `c_stages/hdl_parser.c` | Stage 2 | Recursive descent syntax analyzer and parse tree printer |
+| `c_stages/hdl_parser.exe` | Stage 2 | Compiled binary for Syntax Analysis |
+| `c_stages/hdl_icg.c` | Stage 3 | Three-Address Code (TAC) intermediate representation generator |
+| `c_stages/hdl_icg.exe` | Stage 3 | Compiled binary for Intermediate Code Generation |
+| `c_stages/hdl_opt.c` | Stage 4 | DAG/table-based CSE optimizer, dead code remover & RTL generator |
+| `c_stages/hdl_opt.exe` | Stage 4 | Compiled binary for Stage 4 Optimization & Target Code |
+| `server.js` | Backend | Lightweight Node.js server bridging web frontend to native C binaries |
+| `index.html` | Frontend | Academic split-screen web interface with 4-stage pipeline stepper |
+| `app.js` | Client | Live interaction, filtering, API caller, and client-side simulator |
+| `sample_input.hdl` | Test Case | Baseline circuit (inputs, outputs, wires, and/or gates) |
+| `test_input2.hdl` | Test Case | Circuit with NOT gate, registers, and multiple outputs |
+| `cse_demo.hdl` | Test Case | Circuit demonstrating 50% Common Subexpression Elimination gain |
+
+---
+
+## ⚡ Quick Start
+
+### 1. Run the Full Web Studio (Recommended)
+
+Start the Node.js backend server:
+```bash
+node server.js
+```
+Open your browser at:
+```
+http://localhost:3000
+```
+This runs the full web interface connected directly to the native C binaries compiled on your machine.
+
+*(Note: You can also open `index.html` directly in any web browser without Node.js; the interface includes a full client-side compiler engine as a fallback.)*
+
+---
+
+### 2. Run the C Binaries Directly via Command Line
+
+Each compiler stage can be executed independently directly on any `.hdl` file:
+
+#### Stage 1: Lexical Analysis
+```bash
+./hdl_lexer.exe sample_input.hdl
+```
+
+#### Stage 2: Syntax Analysis
+```bash
+./c_stages/hdl_parser.exe sample_input.hdl
+```
+
+#### Stage 3: Intermediate Code Generation (TAC)
+```bash
+./c_stages/hdl_icg.exe sample_input.hdl
+```
+
+#### Stage 4: Optimization & RTL Target Code
+```bash
+./c_stages/hdl_opt.exe cse_demo.hdl
+```
+
+---
+
+## 🛠️ Recompiling C Stages from Source
+
+If you modify any of the C stage sources, you can recompile using GCC:
+
+```bash
+# Recompile Stage 1 (Lexer)
+flex hdl_lexer.l
+gcc lex.yy.c -o hdl_lexer.exe
+
+# Recompile Stage 2 (Parser)
+gcc c_stages/hdl_parser.c -o c_stages/hdl_parser.exe
+
+# Recompile Stage 3 (ICG)
+gcc c_stages/hdl_icg.c -o c_stages/hdl_icg.exe
+
+# Recompile Stage 4 (Optimizer & Target Code)
+gcc c_stages/hdl_opt.c -o c_stages/hdl_opt.exe
+```
+
+---
+
+## 🧪 Language Grammar (Mini-HDL)
+
+```ebnf
+program     ::= { statement }
+statement   ::= decl_stmt | assign_stmt
+decl_stmt   ::= ("input" | "output" | "wire" | "reg") ident { "," ident } ";"
+assign_stmt ::= ident "=" expr ";"
+expr        ::= term { ("and" | "or" | "xor") term }
+term        ::= "not" term | "(" expr ")" | ident | number
+```
+
+---
+
+## 📊 Optimization Demonstration
+
+Input circuit (`cse_demo.hdl`):
+```verilog
+input a, b, c;
+output out1, out2, out3;
+wire w1, w2, w3;
 
 w1 = a and b;
-y = w1 or clk;
+w2 = a and b;
+w3 = w1 or c;
+out1 = w2 or c;
+out2 = w3;
+out3 = a and b;
 ```
 
-Keywords: `input`, `output`, `wire`, `reg`
-Gate operators: `and`, `or`, `not`
-Identifiers: signal / wire / register names
-Numbers: bit-widths or constants
-Punctuation/operators: `= ; , ( )`
-
-## How to Build and Run
-
-Requires `flex` and `gcc` (both standard on any Linux lab machine).
-
-```bash
-make              # builds the executable "hdl_lexer"
-make run          # builds (if needed) and runs on sample_input.hdl
-```
-
-Or manually:
-```bash
-flex hdl_lexer.l
-gcc lex.yy.c -o hdl_lexer -lfl
-./hdl_lexer sample_input.hdl
-./hdl_lexer test_input2.hdl
-```
-
-Clean build artifacts:
-```bash
-make clean
-```
-
-## What the Program Does
-1. Reads the `.hdl` source file character by character.
-2. Emits a token for every keyword, gate operator, identifier, number,
-   and punctuation symbol — printed as the **Token Stream**.
-3. Tracks which declaration keyword (`input`/`output`/`wire`/`reg`) is
-   currently active; every identifier seen while that is active is
-   inserted into the **Symbol Table** with its category.
-4. At end of file, prints the complete symbol table.
-
-## Sample Output (sample_input.hdl)
-```
-=========================================
- TOKEN STREAM
-=========================================
-KEYWORD       : input
-IDENTIFIER    : a
-PUNCT         : ,
-IDENTIFIER    : b
-PUNCT         : ;
-KEYWORD       : output
-IDENTIFIER    : y
-PUNCT         : ;
-KEYWORD       : wire
-IDENTIFIER    : w1
-PUNCT         : ;
-KEYWORD       : reg
-IDENTIFIER    : clk
-PUNCT         : ;
-IDENTIFIER    : w1
-OPERATOR      : =
-IDENTIFIER    : a
-GATE_OP       : and
-IDENTIFIER    : b
-PUNCT         : ;
-IDENTIFIER    : y
-OPERATOR      : =
-IDENTIFIER    : w1
-GATE_OP       : or
-IDENTIFIER    : clk
-PUNCT         : ;
-
-=========================================
- SYMBOL TABLE
-=========================================
-Name             Category
------------------------------------------
-a                input
-b                input
-y                output
-w1               wire
-clk              reg
------------------------------------------
-Total symbols declared: 5
-```
-
-## Mapping to Syllabus (Modules 1–6)
-- Structure of a compiler — this program implements the first phase.
-- Lexical analysis — token generation via Flex regular-expression rules.
-- Symbol table — implemented as an in-memory array, populated during scanning.
-- Simple lex programs — this file itself.
-
-## Next Phases (Review 2 & 3)
-- **Review 2:** YACC grammar to validate statement structure (syntax analysis).
-- **Review 3:** Convert validated statements to three-address code, then to
-  hardware-style instructions, and apply one optimization (common
-  sub-expression or dead-code elimination).
+**Compiler Result:**
+- **Common Subexpressions Eliminated**: 3 instances of redundant `a and b` and `w1 or c`
+- **Optimization Gain**: **50.0% reduction** in redundant logic evaluations
+- **Target Instructions**: Automatically mapped to Register-Transfer Level (RTL) LOAD, STORE, AND, OR, MOV instructions.

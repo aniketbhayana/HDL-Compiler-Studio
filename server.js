@@ -1,292 +1,324 @@
-// =============================================================================
-//  HDL Compiler Studio - Backend Bridge Server
-//  Compiler Design Lab - Review 1 (Phase 1: Lexical Analysis)
+﻿// =============================================================================
+//  HDL Compiler Studio - Full Pipeline Backend Server
+//  Compiler Design Lab - Reviews 1-4 (Complete Compiler Pipeline)
 //
-//  Zero-dependency HTTP server: uses only native Node.js core modules.
-//  Bridges web UI requests to the compiled C lexer binary (hdl_lexer.exe).
+//  Stages:
+//    Stage 1 (Lexical)     -> hdl_lexer.exe   (C/Flex)
+//    Stage 2 (Syntax)      -> c_stages/hdl_parser.exe (C Recursive Descent)
+//    Stage 3 (ICG)         -> c_stages/hdl_icg.exe    (C TAC Generator)
+//    Stage 4 (Opt+Target)  -> c_stages/hdl_opt.exe    (C Optimizer + RTL)
 // =============================================================================
 
 const http = require('http');
-const fs = require('fs');
+const fs   = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
-const os = require('os');
+const os   = require('os');
 
-const PORT = process.env.PORT || 3000;
+const PORT     = process.env.PORT || 3000;
 const BASE_DIR = __dirname;
 
-// Detect C binary path
-function getLexerBinaryPath() {
-    const exeName = process.platform === 'win32' ? 'hdl_lexer.exe' : 'hdl_lexer';
-    
-    // Check local directory first
-    const localPath = path.join(BASE_DIR, exeName);
-    if (fs.existsSync(localPath)) return localPath;
-
-    // Check Downloads directory where user had it
-    const downloadsPath = path.join(
-        'C:', 'Users', 'Aniket Bhayana', 'Downloads',
-        'HDL_Lexer_Review1', 'HDL_Lexer_Review1', exeName
-    );
-    if (fs.existsSync(downloadsPath)) return downloadsPath;
-
-    return localPath;
+// ── Binary Paths ──────────────────────────────────────────────────────────────
+function bin(name) {
+    const localExe  = path.join(BASE_DIR, name + '.exe');
+    const localPlain = path.join(BASE_DIR, name);
+    if (fs.existsSync(localExe))   return localExe;
+    if (fs.existsSync(localPlain)) return localPlain;
+    return localExe; // will fail gracefully
 }
 
-// Category mappings for tokens
+function stageBin(name) {
+    const p = path.join(BASE_DIR, 'c_stages', name);
+    const pExe = p + '.exe';
+    if (fs.existsSync(pExe)) return pExe;
+    if (fs.existsSync(p))    return p;
+    return pExe;
+}
+
+// ── Stage 1 - Lexer Output Parser ──────────────────────────────────────────
 function getCategoryForType(type) {
-    switch (type) {
-        case 'KEYWORD':    return 'Declaration Keyword';
-        case 'GATE_OP':    return 'Logic Gate Operator';
-        case 'IDENTIFIER': return 'Signal / Register Identifier';
-        case 'NUMBER':     return 'Numeric Constant / Bit-Width';
-        case 'OPERATOR':   return 'Assignment Operator';
-        case 'PUNCT':      return 'Delimiter / Punctuation';
-        case 'UNKNOWN':    return 'Unrecognized / Error';
-        default:           return 'Token';
-    }
+    const map = {
+        'KEYWORD':    'Declaration Keyword',
+        'GATE_OP':    'Logic Gate Operator',
+        'IDENTIFIER': 'Signal / Register Identifier',
+        'NUMBER':     'Numeric Constant / Bit-Width',
+        'OPERATOR':   'Assignment Operator',
+        'PUNCT':      'Delimiter / Punctuation',
+        'UNKNOWN':    'Unrecognized / Error'
+    };
+    return map[type] || 'Token';
 }
 
-// Parse stdout from hdl_lexer
-function parseCLexerStdout(stdout, sourceCode) {
-    const lines = stdout.split(/\r?\n/);
-    const tokens = [];
-    const symbols = [];
-    let section = null;
-    let tokenIndex = 1;
+function parseLexerOutput(stdout, sourceCode) {
+    const lines      = stdout.split(/\r?\n/);
+    const tokens     = [];
+    const symbols    = [];
+    let section      = null;
+    let tokenIndex   = 1;
+    const srcLines   = sourceCode.split(/\r?\n/);
+    let curLine      = 1, curCol = 0;
 
-    // Track line numbers in original source code
-    const sourceLines = sourceCode.split(/\r?\n/);
-    let curLine = 1;
-    let curCol = 0;
-
-    for (let rawLine of lines) {
+    for (const rawLine of lines) {
         const line = rawLine.trim();
         if (!line) continue;
-
-        if (line.includes('TOKEN STREAM')) {
-            section = 'tokens';
-            continue;
-        }
-        if (line.includes('SYMBOL TABLE')) {
-            section = 'symbols';
-            continue;
-        }
-        if (line.startsWith('===') || line.startsWith('---') || 
-            line.startsWith('Name') || line.startsWith('Total symbols')) {
-            continue;
-        }
+        if (line.includes('TOKEN STREAM'))  { section = 'tokens';  continue; }
+        if (line.includes('SYMBOL TABLE'))  { section = 'symbols'; continue; }
+        if (/^(===|---|Name|Total)/.test(line)) continue;
 
         if (section === 'tokens' && line.includes(':')) {
-            const colonIdx = line.indexOf(':');
-            const tokenType = line.substring(0, colonIdx).trim();
-            const lexeme = line.substring(colonIdx + 1).trim();
-
-            if (tokenType && lexeme) {
-                // Determine approximate line number in source
-                let foundLine = curLine;
-                for (let l = curLine - 1; l < sourceLines.length; l++) {
-                    const idx = sourceLines[l].indexOf(lexeme, (l === curLine - 1 ? curCol : 0));
-                    if (idx !== -1) {
-                        foundLine = l + 1;
-                        curLine = foundLine;
-                        curCol = idx + lexeme.length;
-                        break;
-                    }
-                }
-
-                tokens.push({
-                    id: tokenIndex++,
-                    type: tokenType,
-                    lexeme: lexeme,
-                    category: getCategoryForType(tokenType),
-                    line: foundLine
-                });
+            const ci = line.indexOf(':');
+            const tokenType = line.substring(0, ci).trim();
+            const lexeme    = line.substring(ci + 1).trim();
+            if (!tokenType || !lexeme) continue;
+            let foundLine = curLine;
+            for (let l = curLine - 1; l < srcLines.length; l++) {
+                const idx = srcLines[l].indexOf(lexeme, (l === curLine - 1 ? curCol : 0));
+                if (idx !== -1) { foundLine = l + 1; curLine = foundLine; curCol = idx + lexeme.length; break; }
             }
-        } else if (section === 'symbols' && line) {
+            tokens.push({ id: tokenIndex++, type: tokenType, lexeme, category: getCategoryForType(tokenType), line: foundLine });
+        }
+        if (section === 'symbols' && line) {
             const parts = line.split(/\s+/);
-            if (parts.length >= 2) {
-                symbols.push({
-                    name: parts[0],
-                    category: parts[1],
-                    scope: 'Module / Global',
-                    status: 'Declared'
-                });
-            }
+            if (parts.length >= 2) symbols.push({ name: parts[0], category: parts[1], scope: 'Module / Global', status: 'Declared' });
         }
     }
-
     return { tokens, symbols };
 }
 
-// Execute C Lexer
-function runCLexer(sourceCode, callback) {
-    const binPath = getLexerBinaryPath();
-    const startTime = Date.now();
-
-    if (!fs.existsSync(binPath)) {
-        // Try compiling if lex.yy.c exists
-        const lexYyPath = path.join(BASE_DIR, 'lex.yy.c');
-        const fallbackSrc = fs.existsSync(lexYyPath) ? lexYyPath : 
-            path.join('C:', 'Users', 'Aniket Bhayana', 'Downloads', 'HDL_Lexer_Review1', 'HDL_Lexer_Review1', 'lex.yy.c');
-
-        if (fs.existsSync(fallbackSrc)) {
-            console.log('[Server] hdl_lexer.exe not found, auto-compiling from lex.yy.c with gcc...');
-            exec(`gcc "${fallbackSrc}" -o "${binPath}"`, (compileErr) => {
-                if (compileErr) {
-                    return callback(new Error(`Failed to compile C lexer with gcc: ${compileErr.message}`));
-                }
-                proceedWithExecution();
-            });
-            return;
-        } else {
-            return callback(new Error(`C lexer binary not found at ${binPath}. Please compile lex.yy.c first.`));
+// ── Stage 2 - Parser Output Parser ─────────────────────────────────────────
+function parseParserOutput(stdout) {
+    const lines = stdout.split(/\r?\n/);
+    let parseTree = [], result = {}, inTree = true, inResult = false;
+    for (const l of lines) {
+        if (l.includes('SYNTAX ANALYSIS RESULT')) { inTree = false; inResult = true; continue; }
+        if (l.includes('SYNTAX ANALYSIS - PARSE TREE')) { inTree = true; continue; }
+        if (l.startsWith('===') || l.startsWith('---')) continue;
+        if (inTree  && l.trim()) parseTree.push(l);
+        if (inResult && l.includes(':')) {
+            const ci = l.indexOf(':');
+            result[l.substring(0, ci).trim()] = l.substring(ci + 1).trim();
         }
     }
-
-    proceedWithExecution();
-
-    function proceedWithExecution() {
-        const tmpFile = path.join(os.tmpdir(), `hdl_code_${Date.now()}.hdl`);
-        fs.writeFileSync(tmpFile, sourceCode, 'utf8');
-
-        exec(`"${binPath}" "${tmpFile}"`, { timeout: 8000 }, (err, stdout, stderr) => {
-            const durationMs = Date.now() - startTime;
-            try { fs.unlinkSync(tmpFile); } catch (_) {}
-
-            if (err && !stdout) {
-                return callback(new Error(stderr || err.message));
-            }
-
-            const parsed = parseCLexerStdout(stdout, sourceCode);
-            callback(null, {
-                success: true,
-                tokens: parsed.tokens,
-                symbols: parsed.symbols,
-                rawStdout: stdout,
-                rawStderr: stderr || '',
-                binaryPath: binPath,
-                executionTimeMs: durationMs,
-                engine: 'C Lexer Binary (lex.yy.c / hdl_lexer.exe)'
-            });
-        });
-    }
+    return {
+        parseTree: parseTree.join('\n'),
+        status:  result['STATUS']  || 'UNKNOWN',
+        errors:  parseInt(result['ERRORS'] || '0'),
+        verdict: result['VERDICT'] || ''
+    };
 }
 
-// Request Handler
+// ── Stage 3 - ICG Output Parser ─────────────────────────────────────────────
+function parseICGOutput(stdout) {
+    const lines = stdout.split(/\r?\n/);
+    const tac = [], temps = [];
+    let section = null;
+    for (const l of lines) {
+        const line = l.trim();
+        if (line.includes('THREE ADDRESS CODE')) { section = 'tac'; continue; }
+        if (line.includes('TEMPORARY REGISTER')) { section = 'temp'; continue; }
+        if (line.startsWith('===') || line.startsWith('---') || line.startsWith('No.') || line.startsWith('Temp')) continue;
+        if (section === 'tac' && line && !line.startsWith('Total')) {
+            const parts = line.split(/\s+/);
+            if (parts.length >= 3) tac.push({ no: parts[0], result: parts[1], op: parts[2], arg1: parts[3]||'', arg2: parts[4]||'--' });
+        }
+        if (section === 'temp' && line && !line.startsWith('Total')) {
+            const parts = line.split(/\s+/);
+            if (parts.length >= 2 && parts[0].startsWith('t')) temps.push({ temp: parts[0], op: parts[1], arg1: parts[2]||'', arg2: parts[3]||'--' });
+        }
+    }
+    const totalMatch   = stdout.match(/Total TAC instructions:\s*(\d+)/);
+    const tempMatch    = stdout.match(/Temporaries generated\s*:\s*(\d+)/);
+    return { tac, temps, totalTac: totalMatch ? parseInt(totalMatch[1]) : tac.length, totalTemps: tempMatch ? parseInt(tempMatch[1]) : temps.length };
+}
+
+// ── Stage 4 - Optimizer Output Parser ───────────────────────────────────────
+function parseOptOutput(stdout) {
+    const lines = stdout.split(/\r?\n/);
+    let section = null;
+    const unopt = [], opt = [], target = [];
+    const report = {};
+    for (const l of lines) {
+        const line = l.trim();
+        if (line.includes('UNOPTIMIZED THREE-ADDRESS'))  { section = 'unopt'; continue; }
+        if (line.includes('OPTIMIZATION REPORT'))         { section = 'report'; continue; }
+        if (line.includes('OPTIMIZED THREE-ADDRESS'))     { section = 'opt'; continue; }
+        if (line.includes('TARGET CODE'))                  { section = 'target'; continue; }
+        if (line.startsWith('===') || line.startsWith('---') || line.startsWith('No.')) continue;
+        if ((section === 'unopt' || section === 'opt') && line && !line.startsWith('Total')) {
+            const parts = line.split(/\s+/);
+            if (parts.length >= 3) {
+                const row = { no: parts[0], result: parts[1], op: parts[2], arg1: parts[3]||'', arg2: parts[4]||'--' };
+                if (section === 'unopt') unopt.push(row); else opt.push(row);
+            }
+        }
+        if (section === 'report' && line.includes(':')) {
+            const ci = line.indexOf(':'); report[line.substring(0,ci).trim()] = line.substring(ci+1).trim();
+        }
+        if (section === 'target' && line && !line.startsWith('Total') && !line.startsWith('Registers')) {
+            const parts = line.split(/\s+/);
+            if (parts.length >= 2) target.push({ no: parts[0], instr: parts.slice(1).join(' ') });
+        }
+    }
+    return {
+        unopt, opt, target,
+        cseEliminated:  report['Common Subexpressions Eliminated'] || '0',
+        dceRemoved:     report['Dead Code Instructions Removed']   || '0',
+        beforeOpt:      report['Instructions Before Optimization'] || '0',
+        afterOpt:       report['Instructions After  Optimization'] || '0',
+        gain:           report['Optimization Gain'] || '0.0%',
+        totalTarget:    (stdout.match(/Total target instructions:\s*(\d+)/) || ['','0'])[1],
+        regsUsed:       (stdout.match(/Registers used\s*:\s*(\d+)/)        || ['','0'])[1]
+    };
+}
+
+// ── Run a binary with a temp file ───────────────────────────────────────────
+function runBinary(binPath, sourceCode, callback) {
+    if (!fs.existsSync(binPath)) {
+        return callback(new Error('Binary not found: ' + binPath));
+    }
+    const tmp = path.join(os.tmpdir(), `hdl_${Date.now()}.hdl`);
+    fs.writeFileSync(tmp, sourceCode.replace(/\r\n/g, '\n'), 'utf8');
+    const t0 = Date.now();
+    exec(`"${binPath}" "${tmp}"`, { timeout: 8000 }, (err, stdout, stderr) => {
+        try { fs.unlinkSync(tmp); } catch(_) {}
+        const ms = Date.now() - t0;
+        if (err && !stdout) return callback(new Error(stderr || err.message));
+        callback(null, { stdout: stdout || '', stderr: stderr || '', ms });
+    });
+}
+
+// ── Run full pipeline ────────────────────────────────────────────────────────
+function runPipeline(sourceCode, callback) {
+    const lexerBin  = bin('hdl_lexer');
+    const parserBin = stageBin('hdl_parser');
+    const icgBin    = stageBin('hdl_icg');
+    const optBin    = stageBin('hdl_opt');
+
+    const result = { success: true, stages: {} };
+
+    // Stage 1: Lexer
+    runBinary(lexerBin, sourceCode, (err1, r1) => {
+        if (err1) {
+            result.stages.lexer = { error: err1.message };
+        } else {
+            const parsed = parseLexerOutput(r1.stdout, sourceCode);
+            result.stages.lexer = { ...parsed, rawOutput: r1.stdout, ms: r1.ms, status: 'PASS' };
+        }
+
+        // Stage 2: Parser
+        runBinary(parserBin, sourceCode, (err2, r2) => {
+            if (err2) {
+                result.stages.parser = { error: err2.message };
+            } else {
+                result.stages.parser = { ...parseParserOutput(r2.stdout), rawOutput: r2.stdout, ms: r2.ms };
+            }
+
+            // Stage 3: ICG
+            runBinary(icgBin, sourceCode, (err3, r3) => {
+                if (err3) {
+                    result.stages.icg = { error: err3.message };
+                } else {
+                    result.stages.icg = { ...parseICGOutput(r3.stdout), rawOutput: r3.stdout, ms: r3.ms };
+                }
+
+                // Stage 4: Optimizer + Target Code
+                runBinary(optBin, sourceCode, (err4, r4) => {
+                    if (err4) {
+                        result.stages.opt = { error: err4.message };
+                    } else {
+                        result.stages.opt = { ...parseOptOutput(r4.stdout), rawOutput: r4.stdout, ms: r4.ms };
+                    }
+
+                    result.totalMs = (result.stages.lexer?.ms||0) + (result.stages.parser?.ms||0) +
+                                     (result.stages.icg?.ms||0)   + (result.stages.opt?.ms||0);
+                    callback(null, result);
+                });
+            });
+        });
+    });
+}
+
+// ── HTTP Server ──────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
-    // CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-    if (req.method === 'OPTIONS') {
-        res.writeHead(204);
-        res.end();
-        return;
-    }
-
-    // Health / Status check
+    // Status
     if (req.method === 'GET' && req.url === '/api/status') {
-        const binPath = getLexerBinaryPath();
-        const exists = fs.existsSync(binPath);
+        const bins = {
+            lexer:  fs.existsSync(bin('hdl_lexer')),
+            parser: fs.existsSync(stageBin('hdl_parser')),
+            icg:    fs.existsSync(stageBin('hdl_icg')),
+            opt:    fs.existsSync(stageBin('hdl_opt'))
+        };
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-            status: 'online',
-            c_binary_found: exists,
-            binary_path: binPath,
-            os: process.platform,
-            node_version: process.version
-        }));
+        res.end(JSON.stringify({ status: 'online', binaries: bins, node: process.version }));
         return;
     }
 
-    // Sample HDL files
+    // Sample files
     if (req.method === 'GET' && req.url.startsWith('/api/sample')) {
-        const urlParams = new URL(req.url, `http://localhost:${PORT}`);
-        const name = urlParams.searchParams.get('name') || 'sample1';
-        let code = '';
-        if (name === 'sample1') {
-            code = `input a, b;\noutput y;\nwire w1;\nreg clk;\n\nw1 = a and b;\ny = w1 or clk;\n`;
-        } else if (name === 'sample2') {
-            code = `input clk, reset, in1, in2, in3;\noutput reg out1;\noutput wire carry_out;\nwire w1, w2, w3;\n\nw1 = in1 and in2;\nw2 = not in3;\nw3 = w1 or w2;\nout1 = w3 and reset;\ncarry_out = w1 and w3;\n`;
-        } else if (name === 'adder') {
-            code = `input a, b, cin;\noutput sum, cout;\nwire s1, c1, c2;\n\ns1 = a or b;\nc1 = a and b;\nsum = s1 or cin;\nc2 = s1 and cin;\ncout = c1 or c2;\n`;
-        } else {
-            code = `input a, b;\noutput y;\nwire w1;\n\nw1 = a and b;\ny = not w1;\n`;
-        }
+        const name = new URL(req.url, `http://localhost:${PORT}`).searchParams.get('name') || 'sample1';
+        const samples = {
+            sample1: `input a, b;\noutput y;\nwire w1;\nreg clk;\n\nw1 = a and b;\ny = w1 or clk;\n`,
+            sample2: `input x, y, z;\noutput out1, out2;\nwire w1, w2;\nreg state;\n\nw1 = x and y;\nw2 = w1 or z;\nout1 = w2 and not state;\nout2 = state or w1;\n`,
+            adder:   `input a, b, cin;\noutput sum, cout;\nwire s1, c1, c2;\n\ns1 = a or b;\nc1 = a and b;\nsum = s1 or cin;\nc2 = s1 and cin;\ncout = c1 or c2;\n`,
+            cse:     `input a, b, c;\noutput out1, out2, out3;\nwire w1, w2, w3;\n\nw1 = a and b;\nw2 = a and b;\nw3 = w1 or c;\nout1 = w2 or c;\nout2 = w3;\nout3 = a and b;\n`
+        };
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ code }));
+        res.end(JSON.stringify({ code: samples[name] || samples.sample1 }));
         return;
     }
 
-    // POST /api/lex
-    if (req.method === 'POST' && (req.url === '/api/lex' || req.url === '/lex')) {
+    // POST /api/compile - full pipeline
+    if (req.method === 'POST' && req.url === '/api/compile') {
         let body = '';
-        req.on('data', chunk => { body += chunk.toString(); });
+        req.on('data', c => { body += c.toString(); });
         req.on('end', () => {
             try {
-                const payload = JSON.parse(body || '{}');
-                const sourceCode = payload.code || '';
-                if (!sourceCode.trim()) {
+                const { code } = JSON.parse(body || '{}');
+                if (!code || !code.trim()) {
                     res.writeHead(400, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ error: 'Source code cannot be empty.' }));
-                    return;
+                    res.end(JSON.stringify({ error: 'Empty code.' })); return;
                 }
-
-                runCLexer(sourceCode, (err, result) => {
+                runPipeline(code, (err, result) => {
                     if (err) {
                         res.writeHead(500, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({
-                            error: 'Lexer execution error: ' + err.message,
-                            engine: 'C Lexer Binary'
-                        }));
-                        return;
+                        res.end(JSON.stringify({ error: err.message })); return;
                     }
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify(result));
                 });
-            } catch (err) {
+            } catch (e) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'Invalid JSON body: ' + err.message }));
+                res.end(JSON.stringify({ error: 'Bad JSON: ' + e.message }));
             }
         });
         return;
     }
 
     // Serve static files
-    let reqPath = req.url === '/' ? '/index.html' : req.url;
-    reqPath = reqPath.split('?')[0]; // strip query string
-    const filePath = path.join(BASE_DIR, reqPath);
-
-    if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-        const ext = path.extname(filePath).toLowerCase();
-        const contentTypes = {
-            '.html': 'text/html; charset=utf-8',
-            '.css':  'text/css; charset=utf-8',
-            '.js':   'application/javascript; charset=utf-8',
-            '.json': 'application/json; charset=utf-8',
-            '.png':  'image/png',
-            '.ico':  'image/x-icon'
-        };
-        res.writeHead(200, { 'Content-Type': contentTypes[ext] || 'text/plain' });
-        fs.createReadStream(filePath).pipe(res);
+    let p = req.url === '/' ? '/index.html' : req.url.split('?')[0];
+    const fp = path.join(BASE_DIR, p);
+    if (fs.existsSync(fp) && fs.statSync(fp).isFile()) {
+        const ct = {'.html':'text/html;charset=utf-8','.css':'text/css','.js':'application/javascript','.json':'application/json'};
+        res.writeHead(200, { 'Content-Type': ct[path.extname(fp)] || 'text/plain' });
+        fs.createReadStream(fp).pipe(res);
         return;
     }
-
-    res.writeHead(404, { 'Content-Type': 'text/plain' });
-    res.end('Not Found');
+    res.writeHead(404); res.end('Not found');
 });
 
 server.listen(PORT, () => {
-    const binPath = getLexerBinaryPath();
     console.log('===========================================================');
-    console.log('  HDL Compiler Studio - Web Bridge Server');
-    console.log('  Phase 1: Lexical Analysis (C / Flex Engine)');
+    console.log('  HDL Compiler Studio - Full Pipeline Server (Reviews 1-4)');
     console.log('===========================================================');
-    console.log(`  Local URL:        http://localhost:${PORT}`);
-    console.log(`  C Lexer Binary:   ${fs.existsSync(binPath) ? 'FOUND [OK]' : 'MISSING [Auto-compile ready]'}`);
-    console.log(`  Binary Location:  ${binPath}`);
+    console.log(`  URL:    http://localhost:${PORT}`);
+    console.log(`  Lexer:  ${fs.existsSync(bin('hdl_lexer'))  ? 'OK' : 'MISSING'} -> hdl_lexer.exe`);
+    console.log(`  Parser: ${fs.existsSync(stageBin('hdl_parser')) ? 'OK' : 'MISSING'} -> c_stages/hdl_parser.exe`);
+    console.log(`  ICG:    ${fs.existsSync(stageBin('hdl_icg'))    ? 'OK' : 'MISSING'} -> c_stages/hdl_icg.exe`);
+    console.log(`  Opt:    ${fs.existsSync(stageBin('hdl_opt'))    ? 'OK' : 'MISSING'} -> c_stages/hdl_opt.exe`);
     console.log('===========================================================');
-    console.log('  Press Ctrl+C to stop.');
 });

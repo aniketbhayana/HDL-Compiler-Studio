@@ -79,7 +79,7 @@ void add_symbol(const char *name, const char *category) {
 
 %%
 
-int yywrap() { return 1; }
+int yywrap() { return 1; } //no more tokens to be identified
 
 int main(int argc, char **argv) {
     if (argc > 1) {
