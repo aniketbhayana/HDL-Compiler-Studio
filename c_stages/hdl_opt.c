@@ -1,68 +1,83 @@
-﻿/* ================================================================
-   hdl_opt.c
-   Compiler Design Lab - Review 4: Optimization + Target Code Gen
-   
-   Optimizations performed:
-     1. Dead Code Elimination  - remove assignments whose LHS is never read
-     2. Common Subexpression   - detect duplicate (op,a,b) and reuse temp
-     3. Constant Folding       - (future extension placeholder noted)
-   
-   Target Code: Simple hardware-style register-transfer instructions:
-       LOAD  Ra, a
-       LOAD  Rb, b
-       AND   Rt1, Ra, Rb
-       STORE y, Rt1
-   
-   Input:  HDL source file
-   Output: Optimization report + Target instructions
-================================================================ */
-
-#include <stdio.h>
+﻿#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdarg.h>
 
-/* ---- Re-use same lexer / TAC generator from hdl_icg ---- */
+/* ================================================================
+   hdl_opt.c  -  Code Optimizer + Target Code Generator for Mini-HDL
+   Compiler Design Lab - Review 4: Code Optimization & Target Code
+   Optimizations:
+     1. Common Subexpression Elimination (CSE)
+     2. Dead Code Elimination (DCE)
+   Target:
+     Register-Transfer Level (RTL) machine instructions
+================================================================ */
+
 typedef enum {
-    TOK_KEYWORD,TOK_IDENT,TOK_NUMBER,
-    TOK_AND,TOK_OR,TOK_NOT,
-    TOK_EQ,TOK_SEMI,TOK_COMMA,TOK_LPAREN,TOK_RPAREN,
-    TOK_EOF,TOK_UNKNOWN
+    TOK_KEYWORD, TOK_AND, TOK_OR, TOK_NOT,
+    TOK_IDENT, TOK_NUMBER,
+    TOK_EQ, TOK_SEMI, TOK_COMMA, TOK_LPAREN, TOK_RPAREN,
+    TOK_EOF, TOK_UNKNOWN
 } TokType;
 
 typedef struct { TokType type; char lexeme[64]; int line; } Token;
-static char src[65536]; static int pos=0, lineno=1; static Token cur;
+static char src[65536];
+static int  pos=0, lineno=1;
+static Token cur;
 
+static int is_ws(char c){ return c==' '||c=='\t'||c=='\n'||c=='\r'; }
 static void skip_ws(){
-    while(src[pos]){if(src[pos]=='\n'){lineno++;pos++;}else if(isspace((unsigned char)src[pos]))pos++;else break;}
-}
-static Token next_tok(){
-    Token t;t.line=lineno;t.lexeme[0]='\0';skip_ws();
-    if(!src[pos]){t.type=TOK_EOF;strcpy(t.lexeme,"<EOF>");return t;}
-    if(isdigit((unsigned char)src[pos])){int i=0;while(isdigit((unsigned char)src[pos]))t.lexeme[i++]=src[pos++];t.lexeme[i]='\0';t.type=TOK_NUMBER;return t;}
-    if(isalpha((unsigned char)src[pos])||src[pos]=='_'){
-        int i=0;while(isalnum((unsigned char)src[pos])||src[pos]=='_')t.lexeme[i++]=src[pos++];t.lexeme[i]='\0';
-        if(!strcmp(t.lexeme,"input")||!strcmp(t.lexeme,"output")||!strcmp(t.lexeme,"wire")||!strcmp(t.lexeme,"reg"))t.type=TOK_KEYWORD;
-        else if(!strcmp(t.lexeme,"and"))t.type=TOK_AND;
-        else if(!strcmp(t.lexeme,"or"))t.type=TOK_OR;
-        else if(!strcmp(t.lexeme,"not"))t.type=TOK_NOT;
-        else t.type=TOK_IDENT;return t;
+    while(src[pos]){
+        if(src[pos]=='\n') lineno++;
+        if(is_ws(src[pos])) pos++;
+        else break;
     }
-    t.lexeme[0]=src[pos];t.lexeme[1]='\0';
-    switch(src[pos++]){case'=':t.type=TOK_EQ;break;case';':t.type=TOK_SEMI;break;case',':t.type=TOK_COMMA;break;case'(':t.type=TOK_LPAREN;break;case')':t.type=TOK_RPAREN;break;default:t.type=TOK_UNKNOWN;break;}
+}
+static Token lex_tok(){
+    Token t; t.line=lineno; t.lexeme[0]=0;
+    skip_ws();
+    if(!src[pos]){t.type=TOK_EOF;strcpy(t.lexeme,"<EOF>");return t;}
+    if(isdigit((unsigned char)src[pos])){
+        int i=0; while(isdigit((unsigned char)src[pos]))t.lexeme[i++]=src[pos++]; t.lexeme[i]=0;
+        t.type=TOK_NUMBER; return t;
+    }
+    if(isalpha((unsigned char)src[pos])||src[pos]=='_'){
+        int i=0;
+        while(isalnum((unsigned char)src[pos])||src[pos]=='_')t.lexeme[i++]=src[pos++]; t.lexeme[i]=0;
+        if(!strcmp(t.lexeme,"input")||!strcmp(t.lexeme,"output")||
+           !strcmp(t.lexeme,"wire") ||!strcmp(t.lexeme,"reg"))  t.type=TOK_KEYWORD;
+        else if(!strcmp(t.lexeme,"and")) t.type=TOK_AND;
+        else if(!strcmp(t.lexeme,"or"))  t.type=TOK_OR;
+        else if(!strcmp(t.lexeme,"not")) t.type=TOK_NOT;
+        else                              t.type=TOK_IDENT;
+        return t;
+    }
+    t.lexeme[0]=src[pos]; t.lexeme[1]=0;
+    switch(src[pos++]){
+        case'=':t.type=TOK_EQ;break;   case';':t.type=TOK_SEMI;break;
+        case',':t.type=TOK_COMMA;break; case'(':t.type=TOK_LPAREN;break;
+        case')':t.type=TOK_RPAREN;break; default:t.type=TOK_UNKNOWN;break;
+    }
     return t;
 }
-static void advance(){cur=next_tok();}
+static void advance(){ cur=lex_tok(); }
 
 /* ---- TAC ---- */
-typedef struct { char result[64]; char op[8]; char arg1[64]; char arg2[64]; int dead; } TACInstr;
+typedef struct {
+    char result[64]; char op[8]; char arg1[64]; char arg2[64];
+    int dead;       /* 0=live, 1=dead */
+    int cse_killed; /* 1 if eliminated by CSE */
+} TACInstr;
 static TACInstr tac[512]; static int tac_count=0; static int temp_count=0;
 static char temp_name[64];
 static char* new_temp(){snprintf(temp_name,sizeof(temp_name),"t%d",++temp_count);return temp_name;}
 
 static void emit(const char*res,const char*op,const char*a1,const char*a2){
     strncpy(tac[tac_count].result,res,63);strncpy(tac[tac_count].op,op,7);
-    strncpy(tac[tac_count].arg1,a1,63);strncpy(tac[tac_count].arg2,a2,63);tac[tac_count].dead=0;tac_count++;
+    strncpy(tac[tac_count].arg1,a1,63);strncpy(tac[tac_count].arg2,a2,63);
+    tac[tac_count].dead=0; tac[tac_count].cse_killed=0;
+    tac_count++;
 }
 
 static void gen_term(char*out);
@@ -93,52 +108,74 @@ static void gen_assign(){
     if(cur.type==TOK_SEMI)advance();
 }
 
-/* ---- Optimization: Dead Code Elimination ---- */
+/* ---- Optimization 1: Common Subexpression Elimination ---- */
+static int cse_count = 0;
+static void cse() {
+    for(int i=0;i<tac_count;i++){
+        if(tac[i].dead || tac[i].cse_killed) continue;
+        if(!strcmp(tac[i].op,"=")) continue;
+        for(int j=i+1;j<tac_count;j++){
+            if(tac[j].dead || tac[j].cse_killed) continue;
+            if(strcmp(tac[j].op,tac[i].op))   continue;
+            if(strcmp(tac[j].arg1,tac[i].arg1)) continue;
+            if(strcmp(tac[j].arg2,tac[i].arg2)) continue;
+            /* Same expression found: replace all uses of tac[j].result with tac[i].result */
+            char old_res[64]; strcpy(old_res, tac[j].result);
+            for(int k=j+1;k<tac_count;k++){
+                if(!strcmp(tac[k].arg1,old_res)) strcpy(tac[k].arg1, tac[i].result);
+                if(!strcmp(tac[k].arg2,old_res)) strcpy(tac[k].arg2, tac[i].result);
+            }
+            /* Mark tac[j] as CSE-killed — permanently dead, DCE must not resurrect it */
+            tac[j].dead = 1;
+            tac[j].cse_killed = 1;
+            cse_count++;
+        }
+    }
+}
+
+/* ---- Optimization 2: Dead Code Elimination ---- */
 static int dce_count = 0;
 static void dead_code_elimination() {
-    /* Mark live: any result that appears as arg in another instruction, or is an output signal */
-    for (int i=0;i<tac_count;i++) tac[i].dead=1;
+    /*
+     * Mark liveness:
+     *  - Start: all non-CSE-killed instructions are candidates (mark them dead=1 tentatively).
+     *  - CSE-killed instructions stay dead permanently.
+     *  - An instruction is LIVE if its result is used as an arg in any other LIVE instruction.
+     *  - NOTE: We do NOT auto-mark non-temps live — a named signal whose value is
+     *    never read (e.g. because CSE replaced all its uses) should still be dead.
+     *    Only output-port assignments are guaranteed live because they are consumed
+     *    outside this TAC (by the circuit), but since we have no type info here,
+     *    we conservatively keep all non-temp named results live to be safe.
+     *    HOWEVER — if a non-temp was CSE-killed, it stays dead (cse_killed guard above).
+     */
+    for(int i=0;i<tac_count;i++){
+        if(!tac[i].cse_killed) tac[i].dead=1; /* reset to dead for DCE analysis */
+    }
+
     int changed=1;
     while(changed){
         changed=0;
         for(int i=0;i<tac_count;i++){
-            if(tac[i].dead==0) continue; /* already live */
-            /* Check if result is used in any other instr arg */
+            if(tac[i].dead==0) continue; /* already confirmed live */
+            if(tac[i].cse_killed) continue; /* permanently dead from CSE */
+
+            /* Rule 1: result used as arg in another non-dead instruction -> live */
             for(int j=0;j<tac_count;j++){
-                if(i==j)continue;
+                if(i==j || tac[j].dead) continue;
                 if(!strcmp(tac[j].arg1,tac[i].result)||!strcmp(tac[j].arg2,tac[i].result)){
-                    tac[i].dead=0;changed=1;break;
+                    tac[i].dead=0; changed=1; break;
                 }
             }
-            /* Non-temp results (output signals) are always live */
-            if(!(tac[i].result[0]=='t'&&tac[i].result[1]>='0'&&tac[i].result[1]<='9')){
-                tac[i].dead=0;changed=1;
+            /* Rule 2: non-temp result (named signal/output) is always live
+               — but only if NOT cse_killed (guarded above) */
+            if(tac[i].dead && !(tac[i].result[0]=='t'&&tac[i].result[1]>='0'&&tac[i].result[1]<='9')){
+                tac[i].dead=0; changed=1;
             }
         }
     }
-    for(int i=0;i<tac_count;i++)if(tac[i].dead)dce_count++;
-}
-
-/* ---- Optimization: Common Subexpression Elimination ---- */
-static int cse_count = 0;
-static void cse() {
-    for(int i=0;i<tac_count;i++){
-        if(tac[i].dead) continue;
-        if(!strcmp(tac[i].op,"=")) continue;
-        for(int j=i+1;j<tac_count;j++){
-            if(tac[j].dead)continue;
-            if(strcmp(tac[j].op,tac[i].op))continue;
-            if(strcmp(tac[j].arg1,tac[i].arg1))continue;
-            if(strcmp(tac[j].arg2,tac[i].arg2))continue;
-            /* Same expression: replace tac[j].result with tac[i].result in later instrs */
-            char old_res[64]; strcpy(old_res,tac[j].result);
-            for(int k=j+1;k<tac_count;k++){
-                if(!strcmp(tac[k].arg1,old_res))strcpy(tac[k].arg1,tac[i].result);
-                if(!strcmp(tac[k].arg2,old_res))strcpy(tac[k].arg2,tac[i].result);
-            }
-            tac[j].dead=1; cse_count++;
-        }
-    }
+    /* Count only instructions that DCE killed (not CSE kills) */
+    for(int i=0;i<tac_count;i++)
+        if(tac[i].dead && !tac[i].cse_killed) dce_count++;
 }
 
 /* ---- Target Code Generation ---- */
@@ -147,7 +184,7 @@ typedef struct { char var[64]; char reg[8]; } RegEntry;
 static RegEntry regs[128]; static int reg_used=0;
 
 static const char* get_reg(const char*var){
-    for(int i=0;i<reg_used;i++)if(!strcmp(regs[i].var,var))return regs[i].reg;
+    for(int i=0;i<reg_used;i++) if(!strcmp(regs[i].var,var)) return regs[i].reg;
     snprintf(regs[reg_used].reg,sizeof(regs[reg_used].reg),"R%d",reg_count++);
     strncpy(regs[reg_used].var,var,63); return regs[reg_used++].reg;
 }
@@ -158,7 +195,7 @@ static void gen_target(){
     printf("=========================================\n");
     int instr_no=1;
     for(int i=0;i<tac_count;i++){
-        if(tac[i].dead)continue;
+        if(tac[i].dead) continue;
         const char*r_res=get_reg(tac[i].result);
         if(!strcmp(tac[i].op,"=")) {
             const char*r1=get_reg(tac[i].arg1);
@@ -175,7 +212,6 @@ static void gen_target(){
             printf("%-4d LOAD  %-8s %s\n",instr_no++,r2,tac[i].arg2);
             printf("%-4d %-6s%-8s %s, %s\n",instr_no++,tac[i].op,r_res,r1,r2);
         }
-        /* STORE for non-temp output */
         if(!(tac[i].result[0]=='t'&&tac[i].result[1]>='0'&&tac[i].result[1]<='9')){
             printf("%-4d STORE %-8s %s\n",instr_no++,r_res,tac[i].result);
         }
@@ -195,11 +231,12 @@ int main(int argc, char **argv) {
 
     advance();
     while(cur.type!=TOK_EOF){
-        if(cur.type==TOK_KEYWORD)gen_decl();
-        else if(cur.type==TOK_IDENT)gen_assign();
+        if(cur.type==TOK_KEYWORD) gen_decl();
+        else if(cur.type==TOK_IDENT) gen_assign();
         else advance();
     }
 
+    /* Print UNOPTIMIZED TAC */
     printf("=========================================\n");
     printf(" UNOPTIMIZED THREE-ADDRESS CODE\n");
     printf("=========================================\n");
@@ -208,11 +245,15 @@ int main(int argc, char **argv) {
     for(int i=0;i<tac_count;i++){
         printf("%-6d %-16s %-8s %-14s %s\n",i+1,tac[i].result,tac[i].op,tac[i].arg1,tac[i].arg2[0]?tac[i].arg2:"--");
     }
-    printf("Total instructions: %d\n",tac_count);
+    printf("Total instructions: %d\n", tac_count);
 
     /* Run optimizations */
     cse();
     dead_code_elimination();
+
+    /* Count live instructions after optimization */
+    int alive=0;
+    for(int i=0;i<tac_count;i++) if(!tac[i].dead) alive++;
 
     printf("\n=========================================\n");
     printf(" OPTIMIZATION REPORT\n");
@@ -220,10 +261,12 @@ int main(int argc, char **argv) {
     printf("Common Subexpressions Eliminated : %d\n", cse_count);
     printf("Dead Code Instructions Removed   : %d\n", dce_count);
     printf("Instructions Before Optimization : %d\n", tac_count);
-    printf("Instructions After  Optimization : %d\n", tac_count - dce_count - cse_count);
+    printf("Instructions After  Optimization : %d\n", alive);
+    int total_removed = cse_count + dce_count;
     printf("Optimization Gain                : %.1f%%\n",
-           tac_count>0?100.0*(dce_count+cse_count)/tac_count:0.0);
+           tac_count>0 ? 100.0*total_removed/tac_count : 0.0);
 
+    /* Print OPTIMIZED TAC (only live instructions) */
     printf("\n=========================================\n");
     printf(" OPTIMIZED THREE-ADDRESS CODE\n");
     printf("=========================================\n");
@@ -241,4 +284,3 @@ int main(int argc, char **argv) {
 
     return 0;
 }
-
